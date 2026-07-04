@@ -67,3 +67,5 @@ claude mcp add scopus \
 ## License
 
 MIT
+
+<!-- mcp-name: io.github.SMABoundless/scopus -->
