@@ -65,6 +65,18 @@ def test_ris_types_pages_and_authors():
     assert "SP  - 5" in second and "EP  -" not in second
 
 
+def test_ris_omits_abstracts_unless_asked():
+    e = entry(**{"dc:description": "Secret abstract."})
+    assert "AB  -" not in s._entries_to_ris([e])
+    assert "AB  - Secret abstract." in s._entries_to_ris([e], include_abstracts=True)
+
+
+async def test_export_ris_tool_abstract_flag():
+    s._last_results = [entry(**{"dc:description": "Abs."})]
+    assert "AB  -" not in await s.scopus_export_ris()
+    assert "AB  - Abs." in await s.scopus_export_ris(include_abstracts=True)
+
+
 def test_ris_falls_back_to_creator():
     e = entry(**{"dc:creator": "Solo B."})
     del e["author"]

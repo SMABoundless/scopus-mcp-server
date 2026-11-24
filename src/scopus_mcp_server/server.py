@@ -255,8 +255,12 @@ def _doc_types(entry: dict) -> tuple:
     return _TYPE_MAP.get(entry.get("subtype", ""), ("JOUR", "article"))
 
 
-def _entries_to_ris(entries: list) -> str:
-    """Convert Scopus entries to RIS format (Zotero, EndNote, Mendeley)."""
+def _entries_to_ris(entries: list, include_abstracts: bool = False) -> str:
+    """Convert Scopus entries to RIS format (Zotero, EndNote, Mendeley).
+
+    Abstracts are left out unless asked for: they are Elsevier content, and
+    RIS files are usually saved to a reference manager.
+    """
     records = []
     for e in _valid_entries(entries):
         ris_type, _ = _doc_types(e)
@@ -288,7 +292,7 @@ def _entries_to_ris(entries: list) -> str:
         issn = e.get("prism:issn")
         if isbn or issn:
             lines.append(f"SN  - {isbn or issn}")
-        if e.get("dc:description"):
+        if include_abstracts and e.get("dc:description"):
             lines.append(f"AB  - {e['dc:description']}")
         if e.get("eid"):
             lines.append(f"AN  - {e['eid']}")
@@ -732,14 +736,19 @@ async def scopus_quota() -> str:
 
 
 @mcp.tool()
-async def scopus_export_ris() -> str:
+async def scopus_export_ris(include_abstracts: bool = False) -> str:
     """
     Export the most recent search results as RIS format.
     Import the output into Zotero: File → Import → paste or save as .ris file.
+
+    Args:
+        include_abstracts: Include abstracts (default false). Abstracts are
+            Elsevier content; Elsevier's API terms restrict storing it
+            locally, so only include them when the user explicitly asks.
     """
     if not _last_results:
         return "No results to export. Run a search first."
-    ris = _entries_to_ris(_last_results)
+    ris = _entries_to_ris(_last_results, include_abstracts)
     count = len(_valid_entries(_last_results))
     return f"RIS Export ({count} records) — Save as .ris and import into Zotero:\n\n{ris}"
 
