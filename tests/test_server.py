@@ -65,6 +65,18 @@ def test_ris_types_pages_and_authors():
     assert "SP  - 5" in second and "EP  -" not in second
 
 
+def test_ris_omits_abstracts_unless_asked():
+    e = entry(**{"dc:description": "Secret abstract."})
+    assert "AB  -" not in s._entries_to_ris([e])
+    assert "AB  - Secret abstract." in s._entries_to_ris([e], include_abstracts=True)
+
+
+async def test_export_ris_tool_abstract_flag():
+    s._last_results = [entry(**{"dc:description": "Abs."})]
+    assert "AB  -" not in await s.scopus_export_ris()
+    assert "AB  - Abs." in await s.scopus_export_ris(include_abstracts=True)
+
+
 def test_ris_falls_back_to_creator():
     e = entry(**{"dc:creator": "Solo B."})
     del e["author"]
@@ -177,3 +189,99 @@ async def test_author_metrics_failure_is_non_fatal():
     respx.get(f"{BASE}/content/author/author_id/42").mock(return_value=httpx.Response(403))
     out = await s.scopus_author("Smith")
     assert "Author ID: 42" in out and "h-index" not in out
+
+
+# ── Follow-up: identifiers, paging, rate limits ────────────────────────────
+
+@pytest.mark.parametrize("ident,path", [
+    ("85142567890", "/content/abstract/scopus_id/85142567890"),
+    ("SCOPUS_ID:85142567890", "/content/abstract/scopus_id/85142567890"),
+    ("2-s2.0-85142567890", "/content/abstract/eid/2-s2.0-85142567890"),
+    ("10.1016/j.cell.2023.01.001", "/content/abstract/doi/10.1016/j.cell.2023.01.001"),
+    ("https://doi.org/10.1000/a(b)", "/content/abstract/doi/10.1000/a%28b%29"),
+    ("doi:10.1000/xyz", "/content/abstract/doi/10.1000/xyz"),
+    ("pmid:36754049", "/content/abstract/pubmed_id/36754049"),
+])
+def test_abstract_path(ident, path):
+    assert s._abstract_path(ident) == path
+
+
+@respx.mock
+async def test_abstract_by_doi():
+    route = respx.get(f"{BASE}/content/abstract/doi/10.1000/xyz").mock(
+        return_value=httpx.Response(200, json={"abstracts-retrieval-response": {
+            "coredata": {"dc:title": "By DOI", "dc:description": "Abs."}}}))
+    out = await s.scopus_abstract("https://doi.org/10.1000/xyz")
+    assert route.called and "By DOI" in out
+
+
+def search_payload(total, start, n):
+    return {"search-results": {
+        "opensearch:totalResults": str(total),
+        "opensearch:startIndex": str(start),
+        "entry": [entry(**{"dc:title": f"Paper {start + i + 1}"}) for i in range(n)],
+    }}
+
+
+@respx.mock
+async def test_paging_sends_start_and_numbers_results():
+    route = respx.get(f"{BASE}/content/search/scopus").mock(
+        return_value=httpx.Response(200, json=search_payload(60, 25, 25)))
+    out = await s.scopus_search("cats", start=25)
+    assert route.calls.last.request.url.params["start"] == "25"
+    assert "60 total results, showing 26–50" in out
+    assert "call again with start=50" in out
+    assert "26. Paper 26" in out
+
+
+@respx.mock
+async def test_last_page_has_no_more_hint():
+    respx.get(f"{BASE}/content/search/scopus").mock(
+        return_value=httpx.Response(200, json=search_payload(30, 25, 5)))
+    out = await s.scopus_search("cats", start=25)
+    assert "showing 26–30" in out and "call again" not in out
+
+
+@respx.mock
+async def test_start_is_capped_at_scopus_limit():
+    route = respx.get(f"{BASE}/content/search/scopus").mock(
+        return_value=httpx.Response(200, json=search_payload(9000, 4975, 25)))
+    out = await s.scopus_search("cats", start=8000)
+    assert route.calls.last.request.url.params["start"] == "4975"
+    assert "first 5,000 results" in out
+
+
+@respx.mock
+async def test_throttling_is_retried(monkeypatch):
+    monkeypatch.setattr(s, "THROTTLE_BACKOFF", 0)
+    responses = iter([
+        httpx.Response(429, headers={"X-RateLimit-Remaining": "100"}),
+        httpx.Response(200, json=search_payload(1, 0, 1)),
+    ])
+    route = respx.get(f"{BASE}/content/search/scopus").mock(side_effect=lambda r: next(responses))
+    out = await s.scopus_search("cats")
+    assert route.call_count == 2 and "Paper 1" in out
+
+
+@respx.mock
+async def test_quota_exhausted_is_reported_without_retry(monkeypatch):
+    monkeypatch.setattr(s, "THROTTLE_BACKOFF", 0)
+    route = respx.get(f"{BASE}/content/search/scopus").mock(return_value=httpx.Response(
+        429, headers={"X-ELS-Status": "QUOTA_EXCEEDED - Quota Exceeded",
+                      "X-RateLimit-Reset": "1800000000"}))
+    out = await s.scopus_search("cats")
+    assert route.call_count == 1
+    assert "quota exhausted" in out and "2027-01-15 08:00 UTC" in out
+
+
+@respx.mock
+async def test_quota_tool_reports_last_headers(monkeypatch):
+    monkeypatch.setattr(s, "_quota", {})
+    assert "No quota information" in await s.scopus_quota()
+    respx.get(f"{BASE}/content/search/scopus").mock(return_value=httpx.Response(
+        200, json=search_payload(1, 0, 1),
+        headers={"X-RateLimit-Limit": "20000", "X-RateLimit-Remaining": "19990",
+                 "X-RateLimit-Reset": "1800000000"}))
+    await s.scopus_search("cats")
+    out = await s.scopus_quota()
+    assert "Scopus Search: 19990 of 20000 requests left, resets 2027-01-15 08:00 UTC" in out
