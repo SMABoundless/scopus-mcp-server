@@ -1,53 +1,146 @@
 #!/usr/bin/env python3
 """
-Scopus MCP Server for Claude Desktop
+Scopus MCP Server
 
-
-Provides Claude Desktop with tools to search Scopus, retrieve abstracts,
-look up author profiles, and export citations in RIS/BibTeX format.
+Provides tools to search Scopus, retrieve abstracts, look up author
+profiles, and export citations in RIS/BibTeX format.
 """
 
 import os
-import json
+import re
+import unicodedata
+from datetime import date
 from typing import Optional
-from mcp.server.fastmcp import FastMCP
+
 import httpx
+
+try:  # MCP Python SDK 2.x renamed FastMCP to MCPServer
+    from mcp.server.mcpserver import MCPServer
+except ImportError:  # MCP Python SDK 1.x
+    from mcp.server.fastmcp import FastMCP as MCPServer
 
 # ── Configuration ──────────────────────────────────────────────────────────
 
-API_KEY = os.environ.get("SCOPUS_API_KEY", "")
 BASE_URL = "https://api.elsevier.com"
-HEADERS = {
-    "X-ELS-APIKey": API_KEY,
-    "Accept": "application/json",
+
+# Scopus Search API: the COMPLETE view (full author list, abstract) needs
+# institutional entitlement and allows at most 25 results per request.
+MAX_RESULTS = 25
+
+SEARCH_FIELDS = (
+    "dc:title,dc:creator,prism:publicationName,prism:coverDate,"
+    "prism:doi,prism:volume,prism:issueIdentifier,prism:pageRange,"
+    "dc:description,citedby-count,author,eid,dc:identifier,"
+    "subtype,subtypeDescription,prism:isbn,prism:issn"
+)
+
+SORT_OPTIONS = {
+    "relevance": "relevancy",
+    "date": "-coverDate",
+    "citations": "-citedby-count",
 }
 
-mcp = FastMCP("Scopus")
+mcp = MCPServer("Scopus")
+
+
+class MissingAPIKeyError(RuntimeError):
+    pass
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────
 
-async def _get(path: str, params: dict = None) -> dict:
-    """Make an authenticated GET request to the Scopus API."""
-    async with httpx.AsyncClient(timeout=30) as client:
-        resp = await client.get(
-            f"{BASE_URL}{path}",
-            headers=HEADERS,
-            params=params or {},
+def _api_key() -> str:
+    return os.environ.get("SCOPUS_API_KEY", "").strip()
+
+
+def _current_year() -> int:
+    return date.today().year
+
+
+def _date_range(year_from: Optional[str], year_to: Optional[str]) -> Optional[str]:
+    """Build a Scopus `date` parameter, or None if no years were given."""
+    if not year_from and not year_to:
+        return None
+    start = year_from or "1800"
+    end = year_to or str(_current_year() + 1)  # +1 covers in-press items
+    return f"{start}-{end}"
+
+
+async def _get(path: str, params: Optional[dict] = None) -> dict:
+    """Make an authenticated GET request to the Elsevier API.
+
+    The API key is sent only in the X-ELS-APIKey header, never in the URL.
+    """
+    key = _api_key()
+    if not key:
+        raise MissingAPIKeyError(
+            "SCOPUS_API_KEY is not set. Get a key at https://dev.elsevier.com/ "
+            "and add it to this server's environment."
         )
+    headers = {"X-ELS-APIKey": key, "Accept": "application/json"}
+    inst_token = os.environ.get("SCOPUS_INST_TOKEN", "").strip()
+    if inst_token:
+        headers["X-ELS-Insttoken"] = inst_token
+    async with httpx.AsyncClient(timeout=30) as client:
+        resp = await client.get(f"{BASE_URL}{path}", headers=headers, params=params or {})
         resp.raise_for_status()
         return resp.json()
 
 
+def _is_entitlement_error(e: httpx.HTTPStatusError) -> bool:
+    return e.response.status_code in (401, 403)
+
+
+def _error_message(e: Exception) -> str:
+    if isinstance(e, MissingAPIKeyError):
+        return f"Error: {e}"
+    if isinstance(e, httpx.HTTPStatusError):
+        body = e.response.text
+        if len(body) > 500:
+            body = body[:500] + "…"
+        return f"Scopus API error: {e.response.status_code} — {body}"
+    return f"Error: {e}"
+
+
+def _as_list(value) -> list:
+    if value is None:
+        return []
+    if isinstance(value, dict):
+        return [value]
+    return list(value)
+
+
+def _valid_entries(entries: list) -> list:
+    """Drop the placeholder entry Scopus returns for empty result sets."""
+    return [e for e in entries if "error" not in e]
+
+
+def _author_names(entry: dict) -> list:
+    names = [a.get("authname", "") for a in _as_list(entry.get("author"))]
+    names = [n for n in names if n]
+    if names:
+        return names
+    creator = entry.get("dc:creator")
+    return [creator] if creator else []
+
+
 def _format_authors(entry: dict) -> str:
-    """Extract author names from a search result entry."""
-    if "author" in entry:
-        return "; ".join(a.get("authname", "") for a in entry["author"])
-    return entry.get("dc:creator", "Unknown")
+    names = _author_names(entry)
+    return "; ".join(names) if names else "Unknown"
+
+
+def _split_pages(page_range: str) -> tuple:
+    """Split '123-130' (or an en dash) into ('123', '130')."""
+    if not page_range:
+        return "", ""
+    parts = re.split(r"\s*[-–—]\s*", page_range.strip(), maxsplit=1)
+    start = parts[0]
+    end = parts[1] if len(parts) > 1 else ""
+    return start, end
 
 
 def _build_citation_line(entry: dict) -> str:
-    """Build a short citation string: Journal (Year), Vol(Issue), Pages."""
+    """Build a short citation string: Journal, (Year), Vol(Issue), Pages."""
     parts = []
     journal = entry.get("prism:publicationName", "")
     if journal:
@@ -58,10 +151,7 @@ def _build_citation_line(entry: dict) -> str:
     vol = entry.get("prism:volume", "")
     issue = entry.get("prism:issueIdentifier", "")
     if vol:
-        v = vol
-        if issue:
-            v += f"({issue})"
-        parts.append(v)
+        parts.append(f"{vol}({issue})" if issue else vol)
     pages = entry.get("prism:pageRange", "")
     if pages:
         parts.append(pages)
@@ -69,22 +159,19 @@ def _build_citation_line(entry: dict) -> str:
 
 
 def _entries_to_text(entries: list) -> str:
-    """Convert a list of Scopus search entries to readable text."""
+    entries = _valid_entries(entries)
     if not entries:
         return "No results found."
     lines = []
     for i, e in enumerate(entries, 1):
-        if "error" in e:
-            return "No results found."
         title = e.get("dc:title", "Untitled")
-        authors = _format_authors(e)
         citation = _build_citation_line(e)
         doi = e.get("prism:doi", "")
         cited = e.get("citedby-count", "0")
         doc_type = e.get("subtypeDescription", "")
         scopus_id = (e.get("dc:identifier") or "").replace("SCOPUS_ID:", "")
 
-        line = f"{i}. {title}\n   Authors: {authors}\n   {citation}"
+        line = f"{i}. {title}\n   Authors: {_format_authors(e)}\n   {citation}"
         if doc_type:
             line += f"\n   Type: {doc_type}"
         line += f"\n   Cited by: {cited}"
@@ -96,86 +183,183 @@ def _entries_to_text(entries: list) -> str:
     return "\n\n".join(lines)
 
 
+# Scopus subtype code → (RIS type, BibTeX type)
+_TYPE_MAP = {
+    "ar": ("JOUR", "article"),
+    "re": ("JOUR", "article"),
+    "le": ("JOUR", "article"),
+    "ed": ("JOUR", "article"),
+    "no": ("JOUR", "article"),
+    "sh": ("JOUR", "article"),
+    "er": ("JOUR", "article"),
+    "dp": ("JOUR", "article"),
+    "cp": ("CPAPER", "inproceedings"),
+    "cr": ("CPAPER", "inproceedings"),
+    "ch": ("CHAP", "incollection"),
+    "bk": ("BOOK", "book"),
+}
+
+
+def _doc_types(entry: dict) -> tuple:
+    return _TYPE_MAP.get(entry.get("subtype", ""), ("JOUR", "article"))
+
+
 def _entries_to_ris(entries: list) -> str:
-    """Convert Scopus entries to RIS format for Zotero import."""
+    """Convert Scopus entries to RIS format (Zotero, EndNote, Mendeley)."""
     records = []
-    for e in entries:
-        if "error" in e:
-            continue
-        lines = ["TY  - JOUR"]
-        authors = e.get("author", [])
-        if authors:
-            for a in authors:
-                lines.append(f"AU  - {a.get('authname', '')}")
-        elif e.get("dc:creator"):
-            lines.append(f"AU  - {e['dc:creator']}")
+    for e in _valid_entries(entries):
+        ris_type, _ = _doc_types(e)
+        lines = [f"TY  - {ris_type}"]
+        for name in _author_names(e):
+            lines.append(f"AU  - {name}")
         if e.get("dc:title"):
             lines.append(f"TI  - {e['dc:title']}")
         if e.get("prism:publicationName"):
-            lines.append(f"JO  - {e['prism:publicationName']}")
+            tag = "JO" if ris_type == "JOUR" else "T2"
+            lines.append(f"{tag}  - {e['prism:publicationName']}")
         if e.get("prism:volume"):
             lines.append(f"VL  - {e['prism:volume']}")
         if e.get("prism:issueIdentifier"):
             lines.append(f"IS  - {e['prism:issueIdentifier']}")
-        if e.get("prism:pageRange"):
-            lines.append(f"SP  - {e['prism:pageRange']}")
+        sp, ep = _split_pages(e.get("prism:pageRange", ""))
+        if sp:
+            lines.append(f"SP  - {sp}")
+        if ep:
+            lines.append(f"EP  - {ep}")
         year = (e.get("prism:coverDate") or "")[:4]
         if year:
             lines.append(f"PY  - {year}")
         if e.get("prism:doi"):
             lines.append(f"DO  - {e['prism:doi']}")
+        isbn = e.get("prism:isbn")
+        if isinstance(isbn, list):
+            isbn = isbn[0].get("$", "") if isbn and isinstance(isbn[0], dict) else ""
+        issn = e.get("prism:issn")
+        if isbn or issn:
+            lines.append(f"SN  - {isbn or issn}")
         if e.get("dc:description"):
             lines.append(f"AB  - {e['dc:description']}")
-        eid = e.get("eid", "")
-        if eid:
-            lines.append(f"AN  - {eid}")
+        if e.get("eid"):
+            lines.append(f"AN  - {e['eid']}")
         lines.append("ER  - ")
         records.append("\n".join(lines))
     return "\n\n".join(records)
 
 
+_BIBTEX_ESCAPES = {
+    "\\": r"\textbackslash{}",
+    "{": r"\{",
+    "}": r"\}",
+    "&": r"\&",
+    "%": r"\%",
+    "$": r"\$",
+    "#": r"\#",
+    "_": r"\_",
+    "~": r"\textasciitilde{}",
+    "^": r"\textasciicircum{}",
+}
+
+
+def _bibtex_escape(text: str) -> str:
+    return "".join(_BIBTEX_ESCAPES.get(c, c) for c in text)
+
+
+def _ascii_slug(text: str) -> str:
+    normalized = unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode()
+    return re.sub(r"[^A-Za-z0-9]", "", normalized)
+
+
+def _bibtex_key(entry: dict, used: set) -> str:
+    names = _author_names(entry)
+    surname = names[0].split(",")[0].split(" ")[0] if names else ""
+    base = (_ascii_slug(surname) or "unknown") + ((entry.get("prism:coverDate") or "")[:4] or "nd")
+    key = base
+    suffix = ord("a")
+    while key in used:
+        key = f"{base}{chr(suffix)}"
+        suffix += 1
+    used.add(key)
+    return key
+
+
 def _entries_to_bibtex(entries: list) -> str:
-    """Convert Scopus entries to BibTeX format."""
     records = []
-    for e in entries:
-        if "error" in e:
-            continue
-        first_author = ""
-        if e.get("author"):
-            first_author = e["author"][0].get("authname", "unknown").split(" ")[0]
-        elif e.get("dc:creator"):
-            first_author = e["dc:creator"].split(" ")[0]
-        else:
-            first_author = "unknown"
-        year = (e.get("prism:coverDate") or "")[:4] or "nd"
-        key = f"{first_author}{year}"
+    used_keys: set = set()
+    for e in _valid_entries(entries):
+        _, bib_type = _doc_types(e)
+        key = _bibtex_key(e, used_keys)
+        year = (e.get("prism:coverDate") or "")[:4]
+        authors = " and ".join(_author_names(e))
 
-        authors = ""
-        if e.get("author"):
-            authors = " and ".join(a.get("authname", "") for a in e["author"])
-        elif e.get("dc:creator"):
-            authors = e["dc:creator"]
-
-        lines = [f"@article{{{key},"]
+        fields = []
         if e.get("dc:title"):
-            lines.append(f"  title = {{{e['dc:title']}}},")
+            fields.append(("title", e["dc:title"]))
         if authors:
-            lines.append(f"  author = {{{authors}}},")
-        if e.get("prism:publicationName"):
-            lines.append(f"  journal = {{{e['prism:publicationName']}}},")
-        if year != "nd":
-            lines.append(f"  year = {{{year}}},")
+            fields.append(("author", authors))
+        venue = e.get("prism:publicationName")
+        if venue and bib_type != "book":
+            fields.append(("journal" if bib_type == "article" else "booktitle", venue))
+        if year:
+            fields.append(("year", year))
         if e.get("prism:volume"):
-            lines.append(f"  volume = {{{e['prism:volume']}}},")
+            fields.append(("volume", e["prism:volume"]))
         if e.get("prism:issueIdentifier"):
-            lines.append(f"  number = {{{e['prism:issueIdentifier']}}},")
-        if e.get("prism:pageRange"):
-            lines.append(f"  pages = {{{e['prism:pageRange']}}},")
+            fields.append(("number", e["prism:issueIdentifier"]))
+        sp, ep = _split_pages(e.get("prism:pageRange", ""))
+        if sp:
+            fields.append(("pages", f"{sp}--{ep}" if ep else sp))
         if e.get("prism:doi"):
-            lines.append(f"  doi = {{{e['prism:doi']}}},")
+            fields.append(("doi", e["prism:doi"]))
+
+        lines = [f"@{bib_type}{{{key},"]
+        for name, value in fields:
+            value = value if name == "doi" else _bibtex_escape(str(value))
+            lines.append(f"  {name} = {{{value}}},")
         lines.append("}")
         records.append("\n".join(lines))
     return "\n\n".join(records)
+
+
+def _build_query(query: str, search_type: str) -> str:
+    type_map = {
+        "keyword": "TITLE-ABS-KEY({})",
+        "title": "TITLE({})",
+        "author": "AUTHLASTNAME({})",
+        "affiliation": "AFFIL({})",
+        "doi": "DOI({})",
+        "indexed_keyword": "KEY({})",
+        "advanced": "{}",
+    }
+    template = type_map.get(search_type, type_map["keyword"])
+    return template.format(query)
+
+
+async def _search(params: dict, count: int) -> tuple:
+    """Run a Scopus search, preferring the COMPLETE view.
+
+    Falls back to the STANDARD view (first author only, no abstract) if the
+    key isn't entitled to COMPLETE. Returns (search-results dict, view used).
+    """
+    try:
+        data = await _get(
+            "/content/search/scopus",
+            {**params, "view": "COMPLETE", "count": max(1, min(count, MAX_RESULTS))},
+        )
+        return data.get("search-results", {}), "COMPLETE"
+    except httpx.HTTPStatusError as e:
+        if not _is_entitlement_error(e):
+            raise
+    data = await _get(
+        "/content/search/scopus",
+        {**params, "view": "STANDARD", "count": max(1, min(count, MAX_RESULTS))},
+    )
+    return data.get("search-results", {}), "STANDARD"
+
+
+_STANDARD_NOTE = (
+    "Note: your API key is not entitled to the COMPLETE view, so results list "
+    "only the first author and omit abstracts.\n"
+)
 
 
 # ── Store last search results for export ───────────────────────────────────
@@ -192,67 +376,47 @@ async def scopus_search(
     year_from: Optional[str] = None,
     year_to: Optional[str] = None,
     count: int = 25,
+    sort: str = "relevance",
 ) -> str:
     """
     Search Scopus for academic articles.
 
     Args:
         query: Search terms or advanced Scopus query
-        search_type: One of: keyword, title, author, affiliation, doi, advanced
+        search_type: One of: keyword (title, abstract and keywords), title,
+            author (last name), affiliation, doi, indexed_keyword (author and
+            indexed keywords only), advanced (raw Scopus query syntax)
         year_from: Optional start year (e.g. "2020")
         year_to: Optional end year (e.g. "2025")
-        count: Number of results (max 50, default 25)
+        count: Number of results (max 25, default 25)
+        sort: One of: relevance (default), date (newest first), citations
     """
     global _last_results
 
-    # Build the Scopus query based on search type
-    type_map = {
-        "keyword": lambda q: f"KEY({q})",
-        "title": lambda q: f"TITLE({q})",
-        "author": lambda q: f"AUTHLASTNAME({q})",
-        "affiliation": lambda q: f"AFFIL({q})",
-        "doi": lambda q: f"DOI({q})",
-        "advanced": lambda q: q,
-    }
-    builder = type_map.get(search_type, type_map["keyword"])
-    scopus_query = builder(query)
-
+    scopus_query = _build_query(query, search_type)
     params = {
         "query": scopus_query,
-        "apiKey": API_KEY,
-        "count": min(count, 50),
-        "sort": "-coverDate",
-        "field": "dc:title,dc:creator,prism:publicationName,prism:coverDate,"
-                 "prism:doi,prism:volume,prism:issueIdentifier,prism:pageRange,"
-                 "dc:description,citedby-count,author,eid,dc:identifier,"
-                 "subtypeDescription",
+        "sort": SORT_OPTIONS.get(sort, SORT_OPTIONS["relevance"]),
+        "field": SEARCH_FIELDS,
     }
-
-    # Date range
-    if year_from and year_to:
-        params["date"] = f"{year_from}-{year_to}"
-    elif year_from:
-        params["date"] = f"{year_from}-2026"
-    elif year_to:
-        params["date"] = f"1900-{year_to}"
+    date_range = _date_range(year_from, year_to)
+    if date_range:
+        params["date"] = date_range
 
     try:
-        data = await _get("/content/search/scopus", params)
-        results = data.get("search-results", {})
-        entries = results.get("entry", [])
+        results, view = await _search(params, count)
+        entries = _valid_entries(results.get("entry", []))
         total = results.get("opensearch:totalResults", "0")
-
         _last_results = entries
 
         header = f"Scopus Search: {total} total results found, showing {len(entries)}\n"
         header += f"Query: {scopus_query}\n"
+        if view == "STANDARD":
+            header += _STANDARD_NOTE
         header += "=" * 60 + "\n\n"
-
         return header + _entries_to_text(entries)
-    except httpx.HTTPStatusError as e:
-        return f"Scopus API error: {e.response.status_code} — {e.response.text}"
     except Exception as e:
-        return f"Error: {str(e)}"
+        return _error_message(e)
 
 
 @mcp.tool()
@@ -263,41 +427,43 @@ async def scopus_abstract(scopus_id: str) -> str:
     Args:
         scopus_id: The Scopus ID (e.g. "85142567890")
     """
+    scopus_id = scopus_id.strip().replace("SCOPUS_ID:", "")
+    path = f"/content/abstract/scopus_id/{scopus_id}"
     try:
-        data = await _get(f"/content/abstract/scopus_id/{scopus_id}", {"apiKey": API_KEY})
+        try:
+            data = await _get(path, {"view": "FULL"})
+        except httpx.HTTPStatusError as e:
+            if not _is_entitlement_error(e):
+                raise
+            data = await _get(path, {"view": "META_ABS"})
+
         resp = data.get("abstracts-retrieval-response", {})
         coredata = resp.get("coredata", {})
 
         title = coredata.get("dc:title", "Unknown")
-        abstract = coredata.get("dc:description", "No abstract available.")
+        abstract = coredata.get("dc:description") or "No abstract available."
         doi = coredata.get("prism:doi", "")
         journal = coredata.get("prism:publicationName", "")
-        date = coredata.get("prism:coverDate", "")
+        cover_date = coredata.get("prism:coverDate", "")
         cited = coredata.get("citedby-count", "0")
         vol = coredata.get("prism:volume", "")
         issue = coredata.get("prism:issueIdentifier", "")
         pages = coredata.get("prism:pageRange", "")
 
-        # Authors
-        authors_data = resp.get("authors", {}).get("author", [])
-        if isinstance(authors_data, dict):
-            authors_data = [authors_data]
+        authors_data = _as_list((resp.get("authors") or {}).get("author"))
         authors = "; ".join(
-            f"{a.get('ce:surname', '')}, {a.get('ce:given-name', '')}"
+            f"{a.get('ce:surname', '')}, {a.get('ce:given-name', '') or a.get('ce:initials', '')}".strip(", ")
             for a in authors_data
         )
 
-        # Keywords
-        kw_data = resp.get("authkeywords", {})
-        keywords = []
-        if kw_data and "author-keyword" in kw_data:
-            kws = kw_data["author-keyword"]
-            if isinstance(kws, dict):
-                kws = [kws]
-            keywords = [k.get("$", "") for k in kws]
+        keywords = [
+            k.get("$", "")
+            for k in _as_list((resp.get("authkeywords") or {}).get("author-keyword"))
+        ]
 
         output = f"Title: {title}\n"
-        output += f"Authors: {authors}\n"
+        if authors:
+            output += f"Authors: {authors}\n"
         output += f"Journal: {journal}"
         if vol:
             output += f", {vol}"
@@ -305,19 +471,44 @@ async def scopus_abstract(scopus_id: str) -> str:
                 output += f"({issue})"
         if pages:
             output += f", {pages}"
-        output += f"\nDate: {date}\n"
+        output += f"\nDate: {cover_date}\n"
         output += f"Cited by: {cited}\n"
         if doi:
             output += f"DOI: https://doi.org/{doi}\n"
         if keywords:
             output += f"Keywords: {', '.join(keywords)}\n"
         output += f"\nAbstract:\n{abstract}"
-
         return output
-    except httpx.HTTPStatusError as e:
-        return f"Scopus API error: {e.response.status_code} — {e.response.text}"
     except Exception as e:
-        return f"Error: {str(e)}"
+        return _error_message(e)
+
+
+async def _author_metrics(author_ids: list) -> dict:
+    """Fetch h-index and citation counts for up to 25 author IDs.
+
+    Best effort: returns {} if the Author Retrieval API isn't available
+    to this key.
+    """
+    if not author_ids:
+        return {}
+    try:
+        data = await _get(
+            f"/content/author/author_id/{','.join(author_ids[:25])}",
+            {"view": "METRICS"},
+        )
+    except Exception:
+        return {}
+    metrics = {}
+    for r in _as_list(data.get("author-retrieval-response")):
+        core = r.get("coredata", {})
+        aid = (core.get("dc:identifier") or "").replace("AUTHOR_ID:", "")
+        if aid:
+            metrics[aid] = {
+                "h_index": r.get("h-index"),
+                "cited_by": core.get("cited-by-count"),
+                "citations": core.get("citation-count"),
+            }
+    return metrics
 
 
 @mcp.tool()
@@ -326,41 +517,47 @@ async def scopus_author(
     affiliation: Optional[str] = None,
 ) -> str:
     """
-    Look up author profiles on Scopus. Returns h-index, document count,
-    citation count, and subject areas.
+    Look up author profiles on Scopus. Returns affiliation, document count,
+    subject areas, and (when the API key allows it) h-index and citation counts.
 
     Args:
         author_name: Author's last name
         affiliation: Optional affiliation to narrow results (e.g. "Northwestern")
     """
-    query = f"authlast({author_name})"
+    query = f"AUTHLAST({author_name})"
     if affiliation:
-        query += f" AND affil({affiliation})"
+        query += f" AND AFFIL({affiliation})"
 
     try:
-        data = await _get("/content/search/author", {
-            "query": query,
-            "apiKey": API_KEY,
-            "count": 10,
-        })
-        entries = data.get("search-results", {}).get("entry", [])
-
-        if not entries or (len(entries) == 1 and "error" in entries[0]):
+        data = await _get("/content/search/author", {"query": query, "count": 10})
+        entries = _valid_entries(data.get("search-results", {}).get("entry", []))
+        if not entries:
             return f"No authors found for '{author_name}'."
 
+        ids = [
+            (a.get("dc:identifier") or "").replace("AUTHOR_ID:", "")
+            for a in entries
+        ]
+        metrics = await _author_metrics([i for i in ids if i])
+
         lines = []
-        for i, a in enumerate(entries, 1):
+        for i, (a, author_id) in enumerate(zip(entries, ids), 1):
             pref = a.get("preferred-name", {})
             name = f"{pref.get('surname', '')}, {pref.get('given-name', '')}"
             affil_name = (a.get("affiliation-current") or {}).get("affiliation-name", "—")
             docs = a.get("document-count", "—")
-            author_id = (a.get("dc:identifier") or "").replace("AUTHOR_ID:", "")
-            subjects = a.get("subject-area", [])
-            if isinstance(subjects, dict):
-                subjects = [subjects]
+            subjects = _as_list(a.get("subject-area"))
             subj_list = ", ".join(s.get("$", "") for s in subjects[:5])
 
             line = f"{i}. {name}\n   Affiliation: {affil_name}\n   Documents: {docs}"
+            m = metrics.get(author_id)
+            if m:
+                if m.get("h_index") is not None:
+                    line += f"\n   h-index: {m['h_index']}"
+                if m.get("citations") is not None:
+                    line += f"\n   Total citations: {m['citations']}"
+                if m.get("cited_by") is not None:
+                    line += f"\n   Cited by (documents): {m['cited_by']}"
             if subj_list:
                 line += f"\n   Subjects: {subj_list}"
             if author_id:
@@ -369,10 +566,8 @@ async def scopus_author(
             lines.append(line)
 
         return "\n\n".join(lines)
-    except httpx.HTTPStatusError as e:
-        return f"Scopus API error: {e.response.status_code} — {e.response.text}"
     except Exception as e:
-        return f"Error: {str(e)}"
+        return _error_message(e)
 
 
 @mcp.tool()
@@ -382,45 +577,37 @@ async def scopus_author_papers(
     year_from: Optional[str] = None,
 ) -> str:
     """
-    List an author's publications from Scopus.
+    List an author's publications from Scopus, newest first.
 
     Args:
         author_id: Scopus Author ID (from scopus_author results)
-        count: Number of results (max 50, default 25)
+        count: Number of results (max 25, default 25)
         year_from: Optional start year filter
     """
     global _last_results
 
-    query = f"AU-ID({author_id})"
     params = {
-        "query": query,
-        "apiKey": API_KEY,
-        "count": min(count, 50),
-        "sort": "-coverDate",
-        "field": "dc:title,dc:creator,prism:publicationName,prism:coverDate,"
-                 "prism:doi,prism:volume,prism:issueIdentifier,prism:pageRange,"
-                 "dc:description,citedby-count,author,eid,dc:identifier,"
-                 "subtypeDescription",
+        "query": f"AU-ID({author_id.strip()})",
+        "sort": SORT_OPTIONS["date"],
+        "field": SEARCH_FIELDS,
     }
-    if year_from:
-        params["date"] = f"{year_from}-2026"
+    date_range = _date_range(year_from, None)
+    if date_range:
+        params["date"] = date_range
 
     try:
-        data = await _get("/content/search/scopus", params)
-        results = data.get("search-results", {})
-        entries = results.get("entry", [])
+        results, view = await _search(params, count)
+        entries = _valid_entries(results.get("entry", []))
         total = results.get("opensearch:totalResults", "0")
-
         _last_results = entries
 
         header = f"Author ID {author_id}: {total} total publications, showing {len(entries)}\n"
+        if view == "STANDARD":
+            header += _STANDARD_NOTE
         header += "=" * 60 + "\n\n"
-
         return header + _entries_to_text(entries)
-    except httpx.HTTPStatusError as e:
-        return f"Scopus API error: {e.response.status_code} — {e.response.text}"
     except Exception as e:
-        return f"Error: {str(e)}"
+        return _error_message(e)
 
 
 @mcp.tool()
@@ -432,7 +619,7 @@ async def scopus_export_ris() -> str:
     if not _last_results:
         return "No results to export. Run a search first."
     ris = _entries_to_ris(_last_results)
-    count = len([e for e in _last_results if "error" not in e])
+    count = len(_valid_entries(_last_results))
     return f"RIS Export ({count} records) — Save as .ris and import into Zotero:\n\n{ris}"
 
 
@@ -444,7 +631,7 @@ async def scopus_export_bibtex() -> str:
     if not _last_results:
         return "No results to export. Run a search first."
     bib = _entries_to_bibtex(_last_results)
-    count = len([e for e in _last_results if "error" not in e])
+    count = len(_valid_entries(_last_results))
     return f"BibTeX Export ({count} records):\n\n{bib}"
 
 
