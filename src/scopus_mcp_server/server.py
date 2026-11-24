@@ -219,7 +219,6 @@ async def scopus_search(
 
     params = {
         "query": scopus_query,
-        "apiKey": API_KEY,
         "count": min(count, 50),
         "sort": "-coverDate",
         "field": "dc:title,dc:creator,prism:publicationName,prism:coverDate,"
@@ -264,7 +263,7 @@ async def scopus_abstract(scopus_id: str) -> str:
         scopus_id: The Scopus ID (e.g. "85142567890")
     """
     try:
-        data = await _get(f"/content/abstract/scopus_id/{scopus_id}", {"apiKey": API_KEY})
+        data = await _get(f"/content/abstract/scopus_id/{scopus_id}")
         resp = data.get("abstracts-retrieval-response", {})
         coredata = resp.get("coredata", {})
 
@@ -340,7 +339,6 @@ async def scopus_author(
     try:
         data = await _get("/content/search/author", {
             "query": query,
-            "apiKey": API_KEY,
             "count": 10,
         })
         entries = data.get("search-results", {}).get("entry", [])
@@ -394,7 +392,6 @@ async def scopus_author_papers(
     query = f"AU-ID({author_id})"
     params = {
         "query": query,
-        "apiKey": API_KEY,
         "count": min(count, 50),
         "sort": "-coverDate",
         "field": "dc:title,dc:creator,prism:publicationName,prism:coverDate,"
