@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "scopus-mcp-server"
-version = "1.0.0"
+version = "1.1.0"
 description = "MCP server for the Scopus API — search abstracts, authors, and export citations"
 readme = "README.md"
 license = "MIT"
@@ -18,12 +18,21 @@ classifiers = [
     "Programming Language :: Python :: 3",
 ]
 dependencies = [
-    "mcp[cli]>=1.0.0",
+    "mcp[cli]>=1.2.0,<3",
     "httpx>=0.27.0",
 ]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "pytest-asyncio>=0.23", "respx>=0.21"]
 
 [project.scripts]
 scopus-mcp-server = "scopus_mcp_server:main"
 
 [project.urls]
 Repository = "https://github.com/SMABoundless/scopus-mcp-server"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+pythonpath = ["src"]
+testpaths = ["tests"]

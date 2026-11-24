@@ -6,12 +6,12 @@
     "url": "https://github.com/SMABoundless/scopus-mcp-server.git",
     "source": "github"
   },
-  "version": "1.0.0",
+  "version": "1.1.0",
   "packages": [
     {
       "registryType": "pypi",
       "identifier": "scopus-mcp-server",
-      "version": "1.0.0",
+      "version": "1.1.0",
       "runtimeHint": "uvx",
       "transport": {
         "type": "stdio"
@@ -22,6 +22,12 @@
           "isRequired": true,
           "isSecret": true,
           "name": "SCOPUS_API_KEY"
+        },
+        {
+          "description": "Optional Elsevier institutional token, for full-view access outside your institution's network",
+          "isRequired": false,
+          "isSecret": true,
+          "name": "SCOPUS_INST_TOKEN"
         }
       ]
     }

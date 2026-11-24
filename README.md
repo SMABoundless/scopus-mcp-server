@@ -8,38 +8,39 @@ Built with [FastMCP](https://github.com/modelcontextprotocol/python-sdk).
 
 | Tool | Description |
 |------|-------------|
-| `scopus_search` | Search by keyword, title, author, affiliation, DOI, or advanced query |
-| `scopus_abstract` | Retrieve full abstract and metadata for a specific record |
-| `scopus_author` | Look up author profiles (h-index, document count, subject areas) |
+| `scopus_search` | Search by topic (title, abstract and keywords), title, author, affiliation, DOI, or advanced query; sort by relevance, date, or citations |
+| `scopus_abstract` | Retrieve full abstract, authors, keywords, and metadata for a specific record |
+| `scopus_author` | Look up author profiles (affiliation, document count, subject areas, and h-index and citation counts when your key allows it) |
 | `scopus_author_papers` | List an author's publications |
-| `scopus_export_ris` | Export results as RIS (for Zotero, EndNote, etc.) |
-| `scopus_export_bibtex` | Export results as BibTeX |
+| `scopus_export_ris` | Export the last results as RIS (for Zotero, EndNote, etc.) |
+| `scopus_export_bibtex` | Export the last results as BibTeX |
+
+Searches return up to 25 results per call.
 
 ## Setup
 
 ### 1. Get a Scopus API key
 
-You need a Scopus API key from the [Elsevier Developer Portal](https://dev.elsevier.com/). Institutional access (e.g., through a university) is typically required for full functionality.
+Get a key from the [Elsevier Developer Portal](https://dev.elsevier.com/). Use it on your institution's network (or VPN), or also set an institutional token (`SCOPUS_INST_TOKEN`), to get full author lists, abstracts, and author metrics. Without institutional entitlement the server still works, but search results show only the first author and no abstract.
 
-### 2. Install
+### 2. Add to Claude
+
+The server is published on PyPI and runs with [`uv`](https://docs.astral.sh/uv/), so there's nothing to install by hand.
+
+Claude Code:
 
 ```bash
-cd scopus-mcp-server
-python3 -m venv venv
-source venv/bin/activate
-pip install -r requirements.txt
+claude mcp add scopus -e SCOPUS_API_KEY=your-api-key -- uvx scopus-mcp-server
 ```
 
-### 3. Add to Claude Desktop
-
-Add this to your `claude_desktop_config.json`:
+Claude Desktop (`claude_desktop_config.json`):
 
 ```json
 {
   "mcpServers": {
     "scopus": {
-      "command": "/path/to/scopus-mcp-server/venv/bin/python",
-      "args": ["/path/to/scopus-mcp-server/server.py"],
+      "command": "uvx",
+      "args": ["scopus-mcp-server"],
       "env": {
         "SCOPUS_API_KEY": "your-api-key"
       }
@@ -48,14 +49,21 @@ Add this to your `claude_desktop_config.json`:
 }
 ```
 
-Or if using Claude Code CLI:
+### Environment variables
+
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `SCOPUS_API_KEY` | Yes | Your Elsevier API key |
+| `SCOPUS_INST_TOKEN` | No | Elsevier institutional token, for full access off your institution's network |
+
+## Development
 
 ```bash
-claude mcp add scopus \
-  /path/to/scopus-mcp-server/venv/bin/python \
-  /path/to/scopus-mcp-server/server.py \
-  -e SCOPUS_API_KEY=your-api-key
+pip install -e ".[dev]"
+pytest
 ```
+
+The tests mock the Elsevier API, so they don't need a key or network access.
 
 ## Usage examples
 
