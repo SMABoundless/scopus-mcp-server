@@ -162,33 +162,72 @@ async def test_abstract_requests_full_view_then_meta_abs():
     assert "Keywords: cats, dogs" in out
 
 
-@respx.mock
-async def test_author_includes_metrics():
-    respx.get(f"{BASE}/content/search/author").mock(return_value=httpx.Response(200, json={
-        "search-results": {"entry": [{
-            "dc:identifier": "AUTHOR_ID:42",
+def author_search_payload(*ids, total=None):
+    return {"search-results": {
+        "opensearch:totalResults": str(total or len(ids)),
+        "opensearch:startIndex": "0",
+        "entry": [{
+            "dc:identifier": f"AUTHOR_ID:{i}",
             "preferred-name": {"surname": "Smith", "given-name": "Jo"},
             "document-count": "10",
-        }]}}))
-    respx.get(f"{BASE}/content/author/author_id/42").mock(return_value=httpx.Response(200, json={
-        "author-retrieval-response": [{
-            "h-index": "7",
-            "coredata": {"dc:identifier": "AUTHOR_ID:42", "citation-count": "300",
-                         "cited-by-count": "250"},
-        }]}))
-    out = await s.scopus_author("Smith")
-    assert "h-index: 7" in out
-    assert "Total citations: 300" in out
+        } for i in ids]}}
+
+
+def metrics_record(aid, h):
+    return {"h-index": str(h), "coredata": {
+        "dc:identifier": f"AUTHOR_ID:{aid}", "citation-count": "300", "cited-by-count": "250"}}
 
 
 @respx.mock
-async def test_author_metrics_failure_is_non_fatal():
-    respx.get(f"{BASE}/content/search/author").mock(return_value=httpx.Response(200, json={
-        "search-results": {"entry": [{"dc:identifier": "AUTHOR_ID:42",
-                                      "preferred-name": {"surname": "Smith"}}]}}))
-    respx.get(f"{BASE}/content/author/author_id/42").mock(return_value=httpx.Response(403))
+async def test_author_metrics_multi_id_request():
+    respx.get(f"{BASE}/content/search/author").mock(
+        return_value=httpx.Response(200, json=author_search_payload("42", "43")))
+    route = respx.get(f"{BASE}/content/author").mock(return_value=httpx.Response(200, json={
+        "author-retrieval-response-list": {"author-retrieval-response": [
+            metrics_record("42", 7), metrics_record("43", 9)]}}))
     out = await s.scopus_author("Smith")
-    assert "Author ID: 42" in out and "h-index" not in out
+    params = route.calls.last.request.url.params
+    assert params["author_id"] == "42,43" and params["view"] == "METRICS"
+    assert "h-index: 7" in out and "h-index: 9" in out
+    assert "Total citations: 300" in out
+    assert "unavailable" not in out
+
+
+@respx.mock
+async def test_author_metrics_fall_back_to_single_requests():
+    respx.get(f"{BASE}/content/search/author").mock(
+        return_value=httpx.Response(200, json=author_search_payload("42")))
+    respx.get(f"{BASE}/content/author").mock(return_value=httpx.Response(400))
+    respx.get(f"{BASE}/content/author/author_id/42").mock(return_value=httpx.Response(200, json={
+        "author-retrieval-response": [metrics_record("42", 5)]}))
+    out = await s.scopus_author("Smith")
+    assert "h-index: 5" in out
+
+
+@respx.mock
+async def test_author_metrics_failure_is_explained():
+    respx.get(f"{BASE}/content/search/author").mock(
+        return_value=httpx.Response(200, json=author_search_payload("42")))
+    respx.get(f"{BASE}/content/author").mock(return_value=httpx.Response(401))
+    respx.get(f"{BASE}/content/author/author_id/42").mock(return_value=httpx.Response(401))
+    out = await s.scopus_author("Smith")
+    assert "Author ID: 42" in out and "h-index:" not in out
+    assert "h-index and citation counts are unavailable" in out
+    assert "HTTP 401" in out
+
+
+@respx.mock
+async def test_author_search_first_name_paging_and_total():
+    route = respx.get(f"{BASE}/content/search/author").mock(
+        return_value=httpx.Response(200, json=author_search_payload(*map(str, range(25)), total=80)))
+    respx.get(f"{BASE}/content/author").mock(return_value=httpx.Response(400))
+    respx.route(path__startswith="/content/author/author_id/").mock(return_value=httpx.Response(404))
+    out = await s.scopus_author("Smith", affiliation="Northwestern", first_name="J", start=25)
+    params = route.calls.last.request.url.params
+    assert params["query"] == "AUTHLAST(Smith) AND AUTHFIRST(J) AND AFFIL(Northwestern)"
+    assert params["count"] == "25" and params["start"] == "25"
+    assert "80 total results" in out
+    assert "past as well as current affiliations" in out
 
 
 # ── Follow-up: identifiers, paging, rate limits ────────────────────────────

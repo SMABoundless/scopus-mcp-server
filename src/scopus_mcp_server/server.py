@@ -583,65 +583,134 @@ async def scopus_abstract(identifier: str) -> str:
         return _error_message(e)
 
 
-async def _author_metrics(author_ids: list) -> dict:
-    """Fetch h-index and citation counts for up to 25 author IDs.
+def _parse_author_metrics(data: dict) -> dict:
+    """Pull h-index and citation counts out of an Author Retrieval response.
 
-    Best effort: returns {} if the Author Retrieval API isn't available
-    to this key.
+    A single-author response is {"author-retrieval-response": [...]}; a
+    multi-author one wraps that in "author-retrieval-response-list".
     """
-    if not author_ids:
-        return {}
-    try:
-        data = await _get(
-            f"/content/author/author_id/{','.join(author_ids[:25])}",
-            {"view": "METRICS"},
-        )
-    except Exception:
-        return {}
+    wrapper = data.get("author-retrieval-response-list") or data
     metrics = {}
-    for r in _as_list(data.get("author-retrieval-response")):
+    for r in _as_list(wrapper.get("author-retrieval-response")):
         core = r.get("coredata", {})
         aid = (core.get("dc:identifier") or "").replace("AUTHOR_ID:", "")
         if aid:
             metrics[aid] = {
-                "h_index": r.get("h-index"),
+                "h_index": r.get("h-index", core.get("h-index")),
                 "cited_by": core.get("cited-by-count"),
                 "citations": core.get("citation-count"),
             }
     return metrics
 
 
+async def _author_metrics(author_ids: list) -> tuple:
+    """Fetch h-index and citation counts for up to 25 author IDs.
+
+    Returns (metrics by author ID, note). The note explains why metrics are
+    missing, or is "" when they came back.
+    """
+    if not author_ids:
+        return {}, ""
+    ids = author_ids[:25]
+    error = None
+    try:
+        data = await _get(
+            "/content/author",
+            {"author_id": ",".join(ids), "view": "METRICS"},
+        )
+        metrics = _parse_author_metrics(data)
+        if metrics:
+            return metrics, ""
+    except Exception as e:
+        error = e
+
+    # Fall back to one request per author.
+    async def one(aid):
+        try:
+            return _parse_author_metrics(
+                await _get(f"/content/author/author_id/{aid}", {"view": "METRICS"})
+            ), None
+        except Exception as e:
+            return {}, e
+
+    metrics = {}
+    for found, err in await asyncio.gather(*(one(a) for a in ids)):
+        metrics.update(found)
+        error = error or err
+    if metrics:
+        return metrics, ""
+    if isinstance(error, httpx.HTTPStatusError):
+        code = error.response.status_code
+        if code in (401, 403):
+            reason = (
+                f"the Author Retrieval API refused this key (HTTP {code}). "
+                "It may need institutional access: try on campus or VPN, or set SCOPUS_INST_TOKEN"
+            )
+        else:
+            reason = f"the Author Retrieval API returned HTTP {code}"
+    elif error is not None:
+        reason = f"the Author Retrieval API request failed ({error})"
+    else:
+        reason = "the Author Retrieval API returned no metrics"
+    return {}, f"Note: h-index and citation counts are unavailable: {reason}.\n"
+
+
 @mcp.tool()
 async def scopus_author(
     author_name: str,
     affiliation: Optional[str] = None,
+    first_name: Optional[str] = None,
+    start: int = 0,
 ) -> str:
     """
     Look up author profiles on Scopus. Returns affiliation, document count,
     subject areas, and (when the API key allows it) h-index and citation counts.
+    Up to 25 profiles per call; use first_name, affiliation or start to narrow
+    down or page through common surnames.
 
     Args:
         author_name: Author's last name
-        affiliation: Optional affiliation to narrow results (e.g. "Northwestern")
+        affiliation: Optional affiliation to narrow results (e.g. "Northwestern").
+            Matches past as well as current affiliations.
+        first_name: Optional first name or initial (e.g. "Jane" or "J")
+        start: Offset of the first profile, for paging (e.g. 25 for the second page)
     """
     query = f"AUTHLAST({author_name})"
+    if first_name:
+        query += f" AND AUTHFIRST({first_name})"
     if affiliation:
         query += f" AND AFFIL({affiliation})"
 
     try:
-        data = await _get("/content/search/author", {"query": query, "count": 10})
-        entries = _valid_entries(data.get("search-results", {}).get("entry", []))
+        count = MAX_RESULTS
+        start = max(0, min(start, MAX_OFFSET - count))
+        data = await _get(
+            "/content/search/author",
+            {"query": query, "count": count, "start": start},
+        )
+        results = data.get("search-results", {})
+        entries = _valid_entries(results.get("entry", []))
         if not entries:
-            return f"No authors found for '{author_name}'."
+            return f"No authors found for {query}."
 
         ids = [
             (a.get("dc:identifier") or "").replace("AUTHOR_ID:", "")
             for a in entries
         ]
-        metrics = await _author_metrics([i for i in ids if i])
+        metrics, metrics_note = await _author_metrics([i for i in ids if i])
+
+        header = _results_header("Author search", results, entries)
+        header += f"Query: {query}\n"
+        if affiliation:
+            header += (
+                "Affiliation matches past as well as current affiliations, so some "
+                "authors may now be elsewhere.\n"
+            )
+        header += metrics_note
+        header += "=" * 60 + "\n\n"
 
         lines = []
-        for i, (a, author_id) in enumerate(zip(entries, ids), 1):
+        for i, (a, author_id) in enumerate(zip(entries, ids), _page_offset(results) + 1):
             pref = a.get("preferred-name", {})
             name = f"{pref.get('surname', '')}, {pref.get('given-name', '')}"
             affil_name = (a.get("affiliation-current") or {}).get("affiliation-name", "—")
@@ -665,7 +734,7 @@ async def scopus_author(
                 line += f"\n   Scopus Profile: https://www.scopus.com/authid/detail.uri?authorId={author_id}"
             lines.append(line)
 
-        return "\n\n".join(lines)
+        return header + "\n\n".join(lines)
     except Exception as e:
         return _error_message(e)
 

@@ -10,7 +10,7 @@ Built with [FastMCP](https://github.com/modelcontextprotocol/python-sdk).
 |------|-------------|
 | `scopus_search` | Search by topic (title, abstract and keywords), title, author, affiliation, DOI, or advanced query; sort by relevance, date, or citations; page through results |
 | `scopus_abstract` | Retrieve full abstract, authors, keywords, and metadata for one record, by Scopus ID, DOI, EID, or PubMed ID |
-| `scopus_author` | Look up author profiles (affiliation, document count, subject areas, and h-index and citation counts when your key allows it) |
+| `scopus_author` | Look up author profiles by last name, with optional first name and affiliation (affiliation, document count, subject areas, and h-index and citation counts when your key allows it); up to 25 per page |
 | `scopus_author_papers` | List an author's publications, with paging |
 | `scopus_quota` | Show how much of your weekly Elsevier API quota is left |
 | `scopus_export_ris` | Export the last results as RIS (for Zotero, EndNote, etc.); abstracts only if you ask |
