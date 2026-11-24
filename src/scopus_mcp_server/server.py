@@ -6,10 +6,12 @@ Provides tools to search Scopus, retrieve abstracts, look up author
 profiles, and export citations in RIS/BibTeX format.
 """
 
+import asyncio
 import os
 import re
 import unicodedata
-from datetime import date
+from datetime import date, datetime, timezone
+from urllib.parse import quote
 from typing import Optional
 
 import httpx
@@ -26,6 +28,15 @@ BASE_URL = "https://api.elsevier.com"
 # Scopus Search API: the COMPLETE view (full author list, abstract) needs
 # institutional entitlement and allows at most 25 results per request.
 MAX_RESULTS = 25
+
+# Scopus Search API only returns the first 5,000 results without cursor paging.
+MAX_OFFSET = 5000
+
+THROTTLE_RETRIES = 2
+THROTTLE_BACKOFF = 1.0  # seconds; doubles each retry
+
+# Last-seen rate-limit headers, keyed by API ("search/scopus", "abstract", ...).
+_quota: dict = {}
 
 SEARCH_FIELDS = (
     "dc:title,dc:creator,prism:publicationName,prism:coverDate,"
@@ -82,9 +93,41 @@ async def _get(path: str, params: Optional[dict] = None) -> dict:
     if inst_token:
         headers["X-ELS-Insttoken"] = inst_token
     async with httpx.AsyncClient(timeout=30) as client:
-        resp = await client.get(f"{BASE_URL}{path}", headers=headers, params=params or {})
-        resp.raise_for_status()
-        return resp.json()
+        for attempt in range(THROTTLE_RETRIES + 1):
+            resp = await client.get(f"{BASE_URL}{path}", headers=headers, params=params or {})
+            _record_quota(resp, path)
+            if resp.status_code == 429 and not _is_quota_exhausted(resp) and attempt < THROTTLE_RETRIES:
+                # Per-second throttling: back off briefly and retry.
+                await asyncio.sleep(THROTTLE_BACKOFF * (2 ** attempt))
+                continue
+            resp.raise_for_status()
+            return resp.json()
+    raise RuntimeError("unreachable")
+
+
+def _record_quota(resp: httpx.Response, path: str) -> None:
+    """Remember the rate-limit headers Elsevier sends with each response."""
+    limit = resp.headers.get("X-RateLimit-Limit")
+    remaining = resp.headers.get("X-RateLimit-Remaining")
+    reset = resp.headers.get("X-RateLimit-Reset")
+    if limit is None and remaining is None:
+        return
+    parts = path.strip("/").split("/")  # e.g. content/search/scopus
+    api = "/".join(parts[1:3]) if len(parts) > 2 and parts[1] == "search" else parts[min(1, len(parts) - 1)]
+    _quota[api] = {"limit": limit, "remaining": remaining, "reset": reset}
+
+
+def _is_quota_exhausted(resp: httpx.Response) -> bool:
+    status = resp.headers.get("X-ELS-Status", "")
+    return "QUOTA_EXCEEDED" in status.upper() or resp.headers.get("X-RateLimit-Remaining") == "0"
+
+
+def _format_reset(reset: Optional[str]) -> str:
+    try:
+        when = datetime.fromtimestamp(int(reset), tz=timezone.utc)
+    except (TypeError, ValueError):
+        return "unknown"
+    return when.strftime("%Y-%m-%d %H:%M UTC")
 
 
 def _is_entitlement_error(e: httpx.HTTPStatusError) -> bool:
@@ -94,6 +137,14 @@ def _is_entitlement_error(e: httpx.HTTPStatusError) -> bool:
 def _error_message(e: Exception) -> str:
     if isinstance(e, MissingAPIKeyError):
         return f"Error: {e}"
+    if isinstance(e, httpx.HTTPStatusError) and e.response.status_code == 429:
+        if _is_quota_exhausted(e.response):
+            reset = _format_reset(e.response.headers.get("X-RateLimit-Reset"))
+            return (
+                "Scopus API quota exhausted for this API key. "
+                f"It resets at {reset}. Elsevier quotas are weekly per API."
+            )
+        return "Scopus API is rate-limiting requests (too many per second). Try again shortly."
     if isinstance(e, httpx.HTTPStatusError):
         body = e.response.text
         if len(body) > 500:
@@ -158,12 +209,12 @@ def _build_citation_line(entry: dict) -> str:
     return ", ".join(parts)
 
 
-def _entries_to_text(entries: list) -> str:
+def _entries_to_text(entries: list, offset: int = 0) -> str:
     entries = _valid_entries(entries)
     if not entries:
         return "No results found."
     lines = []
-    for i, e in enumerate(entries, 1):
+    for i, e in enumerate(entries, offset + 1):
         title = e.get("dc:title", "Untitled")
         citation = _build_citation_line(e)
         doi = e.get("prism:doi", "")
@@ -334,16 +385,19 @@ def _build_query(query: str, search_type: str) -> str:
     return template.format(query)
 
 
-async def _search(params: dict, count: int) -> tuple:
-    """Run a Scopus search, preferring the COMPLETE view.
+async def _search(params: dict, count: int, start: int = 0) -> tuple:
+    """Run a Scopus search page, preferring the COMPLETE view.
 
     Falls back to the STANDARD view (first author only, no abstract) if the
     key isn't entitled to COMPLETE. Returns (search-results dict, view used).
     """
+    count = max(1, min(count, MAX_RESULTS))
+    start = max(0, min(start, MAX_OFFSET - count))
+    params = {**params, "start": start, "count": count}
     try:
         data = await _get(
             "/content/search/scopus",
-            {**params, "view": "COMPLETE", "count": max(1, min(count, MAX_RESULTS))},
+            {**params, "view": "COMPLETE"},
         )
         return data.get("search-results", {}), "COMPLETE"
     except httpx.HTTPStatusError as e:
@@ -351,9 +405,30 @@ async def _search(params: dict, count: int) -> tuple:
             raise
     data = await _get(
         "/content/search/scopus",
-        {**params, "view": "STANDARD", "count": max(1, min(count, MAX_RESULTS))},
+        {**params, "view": "STANDARD"},
     )
     return data.get("search-results", {}), "STANDARD"
+
+
+def _results_header(label: str, results: dict, entries: list) -> str:
+    total = int(results.get("opensearch:totalResults", "0") or 0)
+    start = int(results.get("opensearch:startIndex", "0") or 0)
+    if not entries:
+        return f"{label}: {total:,} total results, none on this page\n"
+    first, last = start + 1, start + len(entries)
+    header = f"{label}: {total:,} total results, showing {first}–{last}\n"
+    if last < min(total, MAX_OFFSET):
+        header += f"More results available: call again with start={last}.\n"
+    elif total > MAX_OFFSET:
+        header += (
+            f"Scopus only pages through the first {MAX_OFFSET:,} results; "
+            "narrow the query to see the rest.\n"
+        )
+    return header
+
+
+def _page_offset(results: dict) -> int:
+    return int(results.get("opensearch:startIndex", "0") or 0)
 
 
 _STANDARD_NOTE = (
@@ -377,6 +452,7 @@ async def scopus_search(
     year_to: Optional[str] = None,
     count: int = 25,
     sort: str = "relevance",
+    start: int = 0,
 ) -> str:
     """
     Search Scopus for academic articles.
@@ -390,6 +466,7 @@ async def scopus_search(
         year_to: Optional end year (e.g. "2025")
         count: Number of results (max 25, default 25)
         sort: One of: relevance (default), date (newest first), citations
+        start: Offset of the first result, for paging (e.g. 25 for the second page)
     """
     global _last_results
 
@@ -404,31 +481,50 @@ async def scopus_search(
         params["date"] = date_range
 
     try:
-        results, view = await _search(params, count)
+        results, view = await _search(params, count, start)
         entries = _valid_entries(results.get("entry", []))
-        total = results.get("opensearch:totalResults", "0")
         _last_results = entries
 
-        header = f"Scopus Search: {total} total results found, showing {len(entries)}\n"
+        header = _results_header("Scopus Search", results, entries)
         header += f"Query: {scopus_query}\n"
         if view == "STANDARD":
             header += _STANDARD_NOTE
         header += "=" * 60 + "\n\n"
-        return header + _entries_to_text(entries)
+        return header + _entries_to_text(entries, _page_offset(results))
     except Exception as e:
         return _error_message(e)
 
 
+def _abstract_path(identifier: str) -> str:
+    """Map a Scopus ID, EID, DOI or PubMed ID to an Abstract Retrieval path."""
+    ident = identifier.strip()
+    lower = ident.lower()
+    for prefix in ("https://doi.org/", "http://doi.org/", "https://dx.doi.org/", "doi.org/", "doi:"):
+        if lower.startswith(prefix):
+            return f"/content/abstract/doi/{quote(ident[len(prefix):].strip(), safe='/')}"
+    if ident.startswith("10.") and "/" in ident:
+        return f"/content/abstract/doi/{quote(ident, safe='/')}"
+    if lower.startswith("pmid:"):
+        return f"/content/abstract/pubmed_id/{quote(ident[5:].strip(), safe='')}"
+    if lower.startswith("2-s2.0-"):
+        return f"/content/abstract/eid/{quote(ident, safe='')}"
+    if lower.startswith("scopus_id:"):
+        ident = ident[len("scopus_id:"):]
+    return f"/content/abstract/scopus_id/{quote(ident.strip(), safe='')}"
+
+
 @mcp.tool()
-async def scopus_abstract(scopus_id: str) -> str:
+async def scopus_abstract(identifier: str) -> str:
     """
-    Retrieve full abstract and metadata for a Scopus record.
+    Retrieve full abstract and metadata for a single record.
 
     Args:
-        scopus_id: The Scopus ID (e.g. "85142567890")
+        identifier: A Scopus ID (e.g. "85142567890"), DOI (e.g.
+            "10.1016/j.cell.2023.01.001", with or without https://doi.org/),
+            EID (e.g. "2-s2.0-85142567890"), or PubMed ID prefixed with
+            "pmid:" (e.g. "pmid:36754049")
     """
-    scopus_id = scopus_id.strip().replace("SCOPUS_ID:", "")
-    path = f"/content/abstract/scopus_id/{scopus_id}"
+    path = _abstract_path(identifier)
     try:
         try:
             data = await _get(path, {"view": "FULL"})
@@ -575,6 +671,7 @@ async def scopus_author_papers(
     author_id: str,
     count: int = 25,
     year_from: Optional[str] = None,
+    start: int = 0,
 ) -> str:
     """
     List an author's publications from Scopus, newest first.
@@ -583,6 +680,7 @@ async def scopus_author_papers(
         author_id: Scopus Author ID (from scopus_author results)
         count: Number of results (max 25, default 25)
         year_from: Optional start year filter
+        start: Offset of the first result, for paging (e.g. 25 for the second page)
     """
     global _last_results
 
@@ -596,18 +694,41 @@ async def scopus_author_papers(
         params["date"] = date_range
 
     try:
-        results, view = await _search(params, count)
+        results, view = await _search(params, count, start)
         entries = _valid_entries(results.get("entry", []))
-        total = results.get("opensearch:totalResults", "0")
         _last_results = entries
 
-        header = f"Author ID {author_id}: {total} total publications, showing {len(entries)}\n"
+        header = _results_header(f"Author ID {author_id}", results, entries)
         if view == "STANDARD":
             header += _STANDARD_NOTE
         header += "=" * 60 + "\n\n"
-        return header + _entries_to_text(entries)
+        return header + _entries_to_text(entries, _page_offset(results))
     except Exception as e:
         return _error_message(e)
+
+
+@mcp.tool()
+async def scopus_quota() -> str:
+    """
+    Show how much of this API key's Elsevier quota is left, per API.
+    Elsevier quotas are weekly. Figures come from the most recent call to
+    each API, so run a search or lookup first.
+    """
+    if not _quota:
+        return "No quota information yet. Run a search or lookup first."
+    names = {
+        "search/scopus": "Scopus Search",
+        "search/author": "Author Search",
+        "abstract": "Abstract Retrieval",
+        "author": "Author Retrieval",
+    }
+    lines = []
+    for api, q in sorted(_quota.items()):
+        line = f"{names.get(api, api)}: {q.get('remaining') or '?'} of {q.get('limit') or '?'} requests left"
+        if q.get("reset"):
+            line += f", resets {_format_reset(q['reset'])}"
+        lines.append(line)
+    return "\n".join(lines)
 
 
 @mcp.tool()
