@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "scopus-mcp-server"
-version = "1.2.0"
+version = "1.2.1"
 description = "MCP server for the Scopus API — search abstracts, authors, and export citations"
 readme = "README.md"
 license = "MIT"
